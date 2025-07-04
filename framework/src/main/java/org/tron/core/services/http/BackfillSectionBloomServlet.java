@@ -187,6 +187,10 @@ public class BackfillSectionBloomServlet extends RateLimiterServlet {
     logger.info("Starting backfill process for {} blocks (from {} to {})", totalBlocks, startBlock, endBlock);
 
     for (long blockNum = startBlock; blockNum <= endBlock; blockNum++) {
+      if (blockNum % 100 == 0) {
+        long progress = ((blockNum - startBlock + 1) * 100) / totalBlocks;
+        logger.info("Progress: {}% - Processed {}, Skipped {}, Error {}, current block: {}", progress, processedBlocks, skippedBlocks, errorBlocks, blockNum);
+      }
       try {
         // 获取区块数据
         BlockCapsule blockCapsule = chainBaseManager.getBlockByNum(blockNum);
@@ -212,10 +216,6 @@ public class BackfillSectionBloomServlet extends RateLimiterServlet {
           sectionBloomStore.write(blockNum);
           processedBlocks++;
 
-          if (processedBlocks % 100 == 0) {
-            long progress = ((blockNum - startBlock + 1) * 100) / totalBlocks;
-            logger.info("Progress: {}% - Processed {} blocks, current block: {}", progress, processedBlocks, blockNum);
-          }
         } else {
           // 即使没有bloom数据，也要调用write方法来确保数据一致性
           sectionBloomStore.write(blockNum);
