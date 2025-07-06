@@ -23,6 +23,9 @@ configurations.getByName('checkstyleConfig') {
 dependencies {
     //local libraries
     implementation fileTree(dir: 'libs', include: '*.jar')
+    implementation project(":framework")
+    implementation project(":chainbase")
+    implementation project(":common")
     testImplementation project(":framework")
     testImplementation project(":framework").sourceSets.test.output
     implementation group: 'info.picocli', name: 'picocli', version: '4.6.3'

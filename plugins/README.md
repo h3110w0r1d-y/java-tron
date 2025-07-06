@@ -93,6 +93,54 @@ DB lite provides lite database, parameters are compatible with previous `LiteFul
   java -jar Toolkit.jar db lite -o merge --fn-data-path /tmp/snapshot --dataset-path /tmp/history
 ```
 
+## DB Backfill Bloom
+
+DB backfill bloom provides the ability to backfill SectionBloom data for historical blocks to enable eth_getLogs address filtering. This is useful when `isJsonRpcFilterEnabled` was disabled during block processing and later enabled, causing historical blocks to lack SectionBloom data.
+
+### Available parameters:
+
+- `-d | --database-directory`: Specify the database directory path, default: output-directory/database.
+- `-s | --start-block`: Specify the start block number for backfill (required).
+- `-e | --end-block`: Specify the end block number for backfill (optional, default: latest block).
+- `-b | --batch-size`: Specify the batch size for processing blocks, default: 1000.
+- `-c | --max-concurrency`: Specify the maximum concurrency for processing, default: 5.
+- `-f | --force-flush`: Force database flush after each batch, default: true.
+- `-h | --help`: Provide the help info.
+
+### Examples:
+
+```shell script
+# full command
+  java -jar Toolkit.jar db backfill-bloom [-h] -s=<startBlock> [-e=<endBlock>] [-d=<databaseDirectory>] [-b=<batchSize>] [-c=<maxConcurrency>] [-f=<forceFlush>]
+# examples
+   java -jar Toolkit.jar db backfill-bloom -s 1000000 -e 2000000 #1. backfill blocks 1000000 to 2000000
+   java -jar Toolkit.jar db backfill-bloom -s 1000000 -d /path/to/database #2. specify custom database directory
+   java -jar Toolkit.jar db backfill-bloom -s 1000000 -b 2000 -c 8 #3. use larger batch size and higher concurrency
+   java -jar Toolkit.jar db backfill-bloom -s 1000000 --force-flush=false #4. disable force flush for better performance
+```
+
+## DB Debug Tool
+
+DB debug tool provides debugging capabilities for database connections and data verification, particularly useful for troubleshooting backfill operations.
+
+### Available parameters:
+
+- `-d | --database-directory`: Specify the database directory path, default: output-directory/database.
+- `-s | --start-block`: Specify the start block number to check, default: 1000000.
+- `-e | --end-block`: Specify the end block number to check, default: 1000010.
+- `-h | --help`: Provide the help info.
+
+### Examples:
+
+```shell script
+# full command
+  java -jar Toolkit.jar db debug-db [-h] [-d=<databaseDirectory>] [-s=<startBlock>] [-e=<endBlock>]
+# examples
+   java -jar Toolkit.jar db debug-db #1. use default settings
+   java -jar Toolkit.jar db debug-db -d /path/to/database #2. specify custom database directory
+   java -jar Toolkit.jar db debug-db -s 2000000 -e 2000100 #3. check specific block range
+```
+
 ## DB Move
 
 DB move provides a helper to move some dbs to a pre-set new path. For example move `block`, `transactionRetStore` or `transactionHistoryStore` to HDD for reducing storage expenses.
