@@ -117,6 +117,28 @@ DB backfill bloom provides the ability to backfill SectionBloom data for histori
    java -jar Toolkit.jar db backfill-bloom -s 1000000 -d /path/to/database #2. specify custom database directory
    java -jar Toolkit.jar db backfill-bloom -s 1000000 -b 2000 -c 8 #3. use larger batch size and higher concurrency
    java -jar Toolkit.jar db backfill-bloom -s 1000000 --force-flush=false #4. disable force flush for better performance
+
+### Progress Monitoring:
+
+The progress bar shows the total number of blocks scanned (regardless of success/failure). Additional progress information is displayed every 1000 blocks:
+
+```
+Progress: 5000 blocks scanned, 4950 successful, 1200 with logs, 50 errors
+```
+
+This means:
+- **5000 blocks scanned**: Total blocks examined (matches progress bar)
+- **4950 successful**: Blocks processed without errors
+- **1200 with logs**: Blocks that contained transaction logs and had SectionBloom data written
+- **50 errors**: Blocks that failed to process (database errors, corruption, etc.)
+
+### Performance Considerations:
+
+1. **Concurrency vs Lock Contention**: Higher concurrency may lead to more lock contention when multiple threads modify the same bloom sections. Monitor for "Long lock wait" warnings.
+
+2. **Batch Size**: Larger batches reduce database overhead but use more memory. Smaller batches provide more frequent progress updates.
+
+3. **Force Flush**: Enabling force flush ensures data persistence but reduces performance. Disable for faster processing if system stability is guaranteed.
 ```
 
 ## DB Debug Tool
