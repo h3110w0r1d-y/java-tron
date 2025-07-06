@@ -102,7 +102,7 @@ DB backfill bloom provides the ability to backfill SectionBloom data for histori
 - `-d | --database-directory`: Specify the database directory path, default: output-directory/database.
 - `-s | --start-block`: Specify the start block number for backfill (required).
 - `-e | --end-block`: Specify the end block number for backfill (optional, default: latest block).
-- `-b | --batch-size`: Specify the batch size for processing blocks, default: 1000.
+- ~~`-b | --batch-size`~~: Batch size is fixed at 2048 blocks (one section) for optimal performance.
 - `-c | --max-concurrency`: Specify the maximum concurrency for processing, default: 5.
 - `-f | --force-flush`: Force database flush after each batch, default: true.
 - `-h | --help`: Provide the help info.
@@ -111,11 +111,11 @@ DB backfill bloom provides the ability to backfill SectionBloom data for histori
 
 ```shell script
 # full command
-  java -jar Toolkit.jar db backfill-bloom [-h] -s=<startBlock> [-e=<endBlock>] [-d=<databaseDirectory>] [-b=<batchSize>] [-c=<maxConcurrency>] [-f=<forceFlush>]
+  java -jar Toolkit.jar db backfill-bloom [-h] -s=<startBlock> [-e=<endBlock>] [-d=<databaseDirectory>] [-c=<maxConcurrency>] [-f=<forceFlush>]
 # examples
    java -jar Toolkit.jar db backfill-bloom -s 1000000 -e 2000000 #1. backfill blocks 1000000 to 2000000
    java -jar Toolkit.jar db backfill-bloom -s 1000000 -d /path/to/database #2. specify custom database directory
-   java -jar Toolkit.jar db backfill-bloom -s 1000000 -b 2000 -c 8 #3. use larger batch size and higher concurrency
+   java -jar Toolkit.jar db backfill-bloom -s 1000000 -c 8 #3. use higher concurrency (8 threads)
    java -jar Toolkit.jar db backfill-bloom -s 1000000 --force-flush=false #4. disable force flush for better performance
 
 ### Progress Monitoring:
@@ -134,12 +134,39 @@ This means:
 
 ### Performance Considerations:
 
-1. **Concurrency vs Lock Contention**: Higher concurrency may lead to more lock contention when multiple threads modify the same bloom sections. Monitor for "Long lock wait" warnings.
+1. **Section-Based Multi-threading**: Each thread processes exactly one section (2048 blocks) aligned to section boundaries. This eliminates lock contention since different threads never modify the same bloom section.
 
-2. **Batch Size**: Larger batches reduce database overhead but use more memory. Smaller batches provide more frequent progress updates.
+   **Example**: For blocks 1000-4000:
+   - Thread 1 processes Section 0: blocks [1000-2047]
+   - Thread 2 processes Section 1: blocks [2048-4000]
 
-3. **Force Flush**: Enabling force flush ensures data persistence but reduces performance. Disable for faster processing if system stability is guaranteed.
+2. **Lock-Free Design**: No synchronization overhead for bloom writes. Each thread operates on independent data structures.
+
+3. **Optimal Batch Size**: Fixed at 2048 blocks (one section) for maximum efficiency. This aligns perfectly with SectionBloom's internal structure.
+
+4. **Thread-Safe Progress**: Progress bar and console output are synchronized to prevent garbled display. You'll see thread names in progress messages.
+
+5. **Force Flush**: Enabling force flush ensures data persistence but reduces performance. Disable for faster processing if system stability is guaranteed.
+
+### Recommended Settings:
+
+```bash
+# High-performance setup (fast SSD, lots of RAM)
+java -jar Toolkit.jar db backfill-bloom -s 1000000 -e 2000000 -c 8 --force-flush=false
+
+# Balanced setup (most systems)
+java -jar Toolkit.jar db backfill-bloom -s 1000000 -e 2000000 -c 5 --force-flush=true
+
+# Conservative setup (slower systems, network storage)
+java -jar Toolkit.jar db backfill-bloom -s 1000000 -e 2000000 -c 2 --force-flush=true
 ```
+
+### Architecture Benefits:
+
+- **No Lock Contention**: Each thread processes different sections, eliminating synchronization overhead
+- **Perfect Load Distribution**: Work is evenly divided into 2048-block sections
+- **Memory Efficiency**: Each thread maintains minimal state, no shared data structures
+- **Scalability**: Performance scales linearly with CPU cores (up to I/O limits)
 
 ## DB Debug Tool
 

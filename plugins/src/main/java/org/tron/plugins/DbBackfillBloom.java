@@ -6,8 +6,10 @@ import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import me.tongfei.progressbar.ProgressBar;
@@ -44,9 +46,9 @@ public class DbBackfillBloom implements Callable<Integer> {
       "-e" }, description = "End block number for backfill (default: latest block)", order = 3)
   private Long endBlock;
 
-  @CommandLine.Option(names = { "--batch-size",
-      "-b" }, defaultValue = "1000", description = "Batch size for processing blocks. Default: ${DEFAULT-VALUE}", order = 4)
-  private int batchSize;
+  // 固定批次大小为一个 section (2048 blocks)，确保每个线程处理不同的 section
+  private static final int BATCH_SIZE = 2048;
+  private static final int BLOCKS_PER_SECTION = 2048;
 
   @CommandLine.Option(names = { "--max-concurrency",
       "-c" }, defaultValue = "5", description = "Maximum concurrency for processing. Default: ${DEFAULT-VALUE}", order = 5)
@@ -65,12 +67,26 @@ public class DbBackfillBloom implements Callable<Integer> {
   private final AtomicLong blocksWithLogs = new AtomicLong(0); // 包含日志的区块数
   private final AtomicLong errorCount = new AtomicLong(0); // 处理失败的区块数
 
-  // 并发控制：为每个 (section, bitIndex) 组合提供细粒度锁
-  private static final ConcurrentHashMap<Long, Object> bloomLocks = new ConcurrentHashMap<>();
-
-  // 性能监控
+  // 性能监控（无需锁，因为每个线程处理不同的 section）
   private final AtomicLong totalBloomWrites = new AtomicLong(0);
-  private final AtomicLong totalLockWaits = new AtomicLong(0);
+
+  // Section 范围类
+  private static class SectionRange {
+    final long start;
+    final long end;
+    final int sectionId;
+
+    SectionRange(long start, long end, int sectionId) {
+      this.start = start;
+      this.end = end;
+      this.sectionId = sectionId;
+    }
+
+    @Override
+    public String toString() {
+      return String.format("Section %d: [%d-%d]", sectionId, start, end);
+    }
+  }
 
   @Override
   public Integer call() {
@@ -134,13 +150,8 @@ public class DbBackfillBloom implements Callable<Integer> {
       return false;
     }
 
-    if (batchSize <= 0 || batchSize > 10000) {
-      spec.commandLine().getErr().println("Batch size must be between 1 and 10000");
-      return false;
-    }
-
-    if (maxConcurrency <= 0 || maxConcurrency > 20) {
-      spec.commandLine().getErr().println("Max concurrency must be between 1 and 20");
+    if (maxConcurrency <= 0 || maxConcurrency > 128) {
+      spec.commandLine().getErr().println("Max concurrency must be between 1 and 128");
       return false;
     }
 
@@ -177,13 +188,7 @@ public class DbBackfillBloom implements Callable<Integer> {
       if (latestBlockBytes != null) {
         return ByteArray.toLong(latestBlockBytes);
       }
-
-      // Fallback: scan block database for highest block number
-      DBInterface blockDb = DbTool.getDB(databaseDirectory, "block");
-      // This is a simplified approach - in practice you might need more sophisticated
-      // scanning
       return null;
-
     } catch (Exception e) {
       logger.error("Failed to get latest block number", e);
       return null;
@@ -192,54 +197,105 @@ public class DbBackfillBloom implements Callable<Integer> {
 
   private int processBlocks() {
     long totalBlocks = endBlock - startBlock + 1;
-    Semaphore semaphore = new Semaphore(maxConcurrency);
+    ExecutorService executor = Executors.newFixedThreadPool(maxConcurrency);
+    List<CompletableFuture<Void>> futures = new ArrayList<>();
 
     try (ProgressBar pb = new ProgressBar("Scanning blocks for SectionBloom backfill", totalBlocks)) {
 
-      for (long batchStart = startBlock; batchStart <= endBlock; batchStart += batchSize) {
-        long batchEnd = Math.min(batchStart + batchSize - 1, endBlock);
+      // 计算需要处理的 section 范围
+      List<SectionRange> sectionRanges = calculateSectionRanges(startBlock, endBlock);
 
-        try {
-          semaphore.acquire();
-          processBatch(batchStart, batchEnd, pb);
+      spec.commandLine().getOut().printf("Processing %d sections with %d threads\n",
+          sectionRanges.size(), maxConcurrency);
+      // 提交所有 section 任务到线程池，每个线程处理一个完整的 section
+      for (SectionRange range : sectionRanges) {
+        final long finalSectionStart = range.start;
+        final long finalSectionEnd = range.end;
 
-          if (forceFlush) {
-            try {
-              forceFlushDatabase();
-              if (batchStart % 10000 == 0) {
-                spec.commandLine().getOut().printf("Forced database flush after batch %d-%d\n",
-                    batchStart, batchEnd);
-              }
-            } catch (Exception flushException) {
-              spec.commandLine().getOut().printf("Warning: Failed to flush database: %s\n",
-                  flushException.getMessage());
-            }
+        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+          try {
+            processSection(finalSectionStart, finalSectionEnd, pb);
+          } catch (Exception e) {
+            spec.commandLine().getOut().printf("Error processing section %d to %d, %s\n",
+                finalSectionStart, finalSectionEnd, e);
+            // 注意：section 内部的错误已经在 processSection 中统计了
           }
+        }, executor);
 
-        } catch (Exception e) {
-          spec.commandLine().getOut().printf("Error processing batch %d to %d, %s\n", batchStart, batchEnd, e);
-          errorCount.incrementAndGet();
-        } finally {
-          semaphore.release();
-        }
+        futures.add(future);
+      }
+
+      // 等待所有任务完成
+      CompletableFuture<Void> allTasks = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+
+      try {
+        allTasks.get(); // 等待所有任务完成
+        spec.commandLine().getOut().printf("All %d batch tasks completed\n", futures.size());
+      } catch (Exception e) {
+        spec.commandLine().getOut().printf("Error waiting for tasks to complete: %s\n", e.getMessage());
+        return 1;
       }
 
     } catch (Exception e) {
       spec.commandLine().getOut().printf("Error in progress tracking %s\n", e);
       return 1;
+    } finally {
+      // 关闭线程池
+      executor.shutdown();
+      try {
+        if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+          spec.commandLine().getOut().println("Forcing shutdown of executor...");
+          executor.shutdownNow();
+        }
+      } catch (InterruptedException e) {
+        executor.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
     }
 
     return errorCount.get() > 0 ? 1 : 0;
   }
 
-  private void processBatch(long batchStart, long batchEnd, ProgressBar pb) {
+  /**
+   * 计算需要处理的 section 范围，确保每个线程处理完整的 section
+   * 例如：startBlock=1000, endBlock=4000 会生成：
+   * - Section 0: [1000-2047] (section 0 的剩余部分)
+   * - Section 1: [2048-4095] (完整的 section 1，但只处理到 4000)
+   */
+  private List<SectionRange> calculateSectionRanges(long startBlock, long endBlock) {
+    List<SectionRange> ranges = new ArrayList<>();
+
+    long currentBlock = startBlock;
+    while (currentBlock <= endBlock) {
+      // 计算当前区块所属的 section
+      int sectionId = (int) (currentBlock / BLOCKS_PER_SECTION);
+
+      // 计算这个 section 的边界
+      long sectionStart = sectionId * BLOCKS_PER_SECTION;
+      long sectionEnd = sectionStart + BLOCKS_PER_SECTION - 1;
+
+      // 调整为实际需要处理的范围
+      long rangeStart = Math.max(currentBlock, sectionStart);
+      long rangeEnd = Math.min(endBlock, sectionEnd);
+
+      ranges.add(new SectionRange(rangeStart, rangeEnd, sectionId));
+
+      // 移动到下一个 section
+      currentBlock = sectionEnd + 1;
+    }
+
+    return ranges;
+  }
+
+  private void processSection(long sectionStart, long sectionEnd, ProgressBar pb) {
+    int sectionId = (int) (sectionStart / BLOCKS_PER_SECTION);
     try {
       DBInterface transactionRetDb = DbTool.getDB(databaseDirectory, "transactionRetStore");
       DBInterface sectionBloomDb = DbTool.getDB(databaseDirectory, "section-bloom");
 
-      for (long blockNum = batchStart; blockNum <= batchEnd; blockNum++) {
+      for (long blockNum = sectionStart; blockNum <= sectionEnd; blockNum++) {
         // 无论处理结果如何，都更新进度
-        processedBlocks.incrementAndGet();
+        long currentProcessed = processedBlocks.incrementAndGet();
         pb.step();
 
         try {
@@ -249,22 +305,10 @@ public class DbBackfillBloom implements Callable<Integer> {
           spec.commandLine().getOut().printf("Error processing block %d, %s\n", blockNum, e);
           errorCount.incrementAndGet();
         }
-
-        // 每处理1000个区块显示详细进度信息
-        if (processedBlocks.get() % 1000 == 0) {
-          long processed = processedBlocks.get();
-          long successful = successfulBlocks.get();
-          long withLogs = blocksWithLogs.get();
-          long errors = errorCount.get();
-
-          spec.commandLine().getOut().printf(
-              "Progress: %d blocks scanned, %d successful, %d with logs, %d errors\n",
-              processed, successful, withLogs, errors);
-        }
       }
 
     } catch (Exception e) {
-      spec.commandLine().getOut().printf("Error in batch processing %s", e);
+      spec.commandLine().getOut().printf("Error in section %d processing: %s\n", sectionId, e);
       throw new RuntimeException(e);
     }
   }
@@ -277,22 +321,11 @@ public class DbBackfillBloom implements Callable<Integer> {
     byte[] transactionRetData = transactionRetDb.get(blockKey);
 
     if (transactionRetData == null) {
-      // Debug: Check if the key format is correct
-      if (blockNum % 1000 == 0) {
-        spec.commandLine().getOut().printf("Debug: No transaction data found for block %d (key: %s)\n",
-            blockNum, ByteArray.toHexString(blockKey));
-      }
       return;
     }
 
     try {
       TransactionRetCapsule transactionRetCapsule = new TransactionRetCapsule(transactionRetData);
-
-      // Debug: Check transaction count
-      int transactionCount = transactionRetCapsule.getInstance().getTransactioninfoCount();
-      if (blockNum % 1000 == 0) {
-        spec.commandLine().getOut().printf("Debug: Block %d has %d transactions\n", blockNum, transactionCount);
-      }
 
       // Create bloom filter for this block using the same logic as SectionBloomStore
       Bloom blockBloom = Bloom.createBloom(transactionRetCapsule);
@@ -306,8 +339,6 @@ public class DbBackfillBloom implements Callable<Integer> {
           writeSectionBloom(blockNum, bitList, sectionBloomDb);
           blocksWithLogs.incrementAndGet();
         }
-      } else if (blockNum % 1000 == 0) {
-        spec.commandLine().getOut().printf("Debug: Block %d has no bloom data\n", blockNum);
       }
     } catch (Exception e) {
       spec.commandLine().getOut().printf("Error processing block %d: %s\n", blockNum, e.getMessage());
@@ -331,42 +362,23 @@ public class DbBackfillBloom implements Callable<Integer> {
   private void writeSectionBloom(long blockNum, List<Integer> bitList, DBInterface sectionBloomDb)
       throws RocksDBException, EventBloomException {
 
-    // Constants from SectionBloomStore
-    final int BLOCK_PER_SECTION = 2048;
-
-    int section = (int) (blockNum / BLOCK_PER_SECTION);
-    int blockNumOffset = (int) (blockNum % BLOCK_PER_SECTION);
+    int section = (int) (blockNum / BLOCKS_PER_SECTION);
+    int blockNumOffset = (int) (blockNum % BLOCKS_PER_SECTION);
 
     for (int bitIndex : bitList) {
-      long keyLong = combineKey(section, bitIndex);
-
-      // 使用细粒度锁确保 get -> modify -> put 操作的原子性
-      Object lock = bloomLocks.computeIfAbsent(keyLong, k -> new Object());
-
-      long lockStartTime = System.nanoTime();
-      synchronized (lock) {
-        totalLockWaits.incrementAndGet();
-
-        // Get existing BitSet from database
-        BitSet bitSet = getSectionBloomBitSet(section, bitIndex, sectionBloomDb);
-        if (Objects.isNull(bitSet)) {
-          bitSet = new BitSet(BLOCK_PER_SECTION);
-        }
-
-        // Update the bit for this block
-        bitSet.set(blockNumOffset);
-
-        // Put back into database
-        putSectionBloomBitSet(section, bitIndex, bitSet, sectionBloomDb);
-        totalBloomWrites.incrementAndGet();
+      // 无需锁：每个线程处理不同的 section，不会有并发冲突
+      // Get existing BitSet from database
+      BitSet bitSet = getSectionBloomBitSet(section, bitIndex, sectionBloomDb);
+      if (Objects.isNull(bitSet)) {
+        bitSet = new BitSet(BLOCKS_PER_SECTION);
       }
 
-      // 如果锁等待时间过长，记录警告
-      long lockWaitTime = System.nanoTime() - lockStartTime;
-      if (lockWaitTime > 10_000_000) { // 10ms
-        spec.commandLine().getOut().printf("Warning: Long lock wait for section %d, bit %d: %d ms\n",
-            section, bitIndex, lockWaitTime / 1_000_000);
-      }
+      // Update the bit for this block
+      bitSet.set(blockNumOffset);
+
+      // Put back into database
+      putSectionBloomBitSet(section, bitIndex, bitSet, sectionBloomDb);
+      totalBloomWrites.incrementAndGet();
     }
   }
 
@@ -375,7 +387,7 @@ public class DbBackfillBloom implements Callable<Integer> {
   }
 
   private BitSet getSectionBloomBitSet(int section, int bitIndex, DBInterface sectionBloomDb)
-      throws RocksDBException, EventBloomException {
+      throws EventBloomException {
     long keyLong = combineKey(section, bitIndex);
     byte[] key = Long.toHexString(keyLong).getBytes();
     byte[] data = sectionBloomDb.get(key);
@@ -405,24 +417,6 @@ public class DbBackfillBloom implements Callable<Integer> {
     }
   }
 
-  /**
-   * 强制刷盘数据库，确保数据持久化
-   * 注意：这是一个简化实现，实际的 RocksDB 刷盘可能需要更复杂的操作
-   */
-  private void forceFlushDatabase() throws Exception {
-    // 对于 DbTool 管理的数据库，我们可以尝试关闭并重新打开连接来强制刷盘
-    // 这不是最优解，但在 toolkit 环境下是一个可行的方案
-
-    // 注意：这里我们依赖 DbTool 的内部缓存机制
-    // 在实际的 Tron 节点中，应该使用 RevokingStore 的 flush 方法
-
-    // 简单的实现：记录刷盘操作（实际的刷盘由 RocksDB 的 WAL 和后台线程处理）
-    // 在生产环境中，可以考虑调用 RocksDB 的 flushWal() 或 syncWal() 方法
-
-    // 这里我们只是标记操作完成，实际的持久化由 RocksDB 的默认机制保证
-    // 如果需要更强的持久化保证，可以在 DbTool 中添加 flush 接口
-  }
-
   private void printSummary(long duration) {
     spec.commandLine().getOut().println("\n=== Backfill Summary ===");
 
@@ -445,8 +439,8 @@ public class DbBackfillBloom implements Callable<Integer> {
 
     // 性能统计
     spec.commandLine().getOut().printf("Total bloom writes: %d%n", totalBloomWrites.get());
-    spec.commandLine().getOut().printf("Total lock acquisitions: %d%n", totalLockWaits.get());
-    spec.commandLine().getOut().printf("Unique bloom sections used: %d%n", bloomLocks.size());
+    spec.commandLine().getOut().printf("Max concurrency used: %d threads%n", maxConcurrency);
+    spec.commandLine().getOut().printf("Section-based processing: No locks needed%n");
 
     if (duration > 0) {
       spec.commandLine().getOut().printf("Scanning rate: %.2f blocks/second%n",
@@ -466,8 +460,5 @@ public class DbBackfillBloom implements Callable<Integer> {
       spec.commandLine().getOut().printf("⚠ Backfill completed with %d errors. Check output above for details.%n",
           errorCount.get());
     }
-
-    // 清理锁映射以释放内存
-    bloomLocks.clear();
   }
 }
